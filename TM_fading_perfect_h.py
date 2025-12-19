@@ -911,28 +911,20 @@ def train_autoencoder(tm_decoder, tm_encoders, param_estimator, epochs, snr_db, 
         
 
 
-    
-        # 1. Define Rate (Bits per Symbol)
-        # We use N_NORMAL because x has 2*N_NORMAL columns (Real+Imag), so N_NORMAL complex symbols.
+   
         rate = K_NORMAL / N_NORMAL 
 
-        # 2. Calculate per-sample signal power
-        # x_org is (Batch, 2*N), we average over the 2*N dimensions.
-        signal_power_batch = np.mean(x_org.numpy()**2, axis=1) # Shape: [BATCH_SIZE]
+    
+        signal_power_batch = np.mean(x_org.numpy()**2, axis=1) 
 
-        # 3. Convert Eb/N0 (dB) -> Eb/N0 (linear) -> SNR (linear)
-        # current_snr_db_batch is now treated as Eb/N0
         ebn0_linear_batch = 10**(current_snr_db_batch / 10.0) 
-        snr_linear_batch = ebn0_linear_batch * rate  # <--- CRITICAL FIX: Convert to Es/N0
+        snr_linear_batch = ebn0_linear_batch * rate  
 
-        # 4. Calculate Noise Variance
-        # Default variance if power is ~0 (safe division)
+      
         noise_variance_batch = 1.0 / (snr_linear_batch + 1e-10)
 
-        # Create mask for samples with valid power
         valid_power_mask = signal_power_batch > 1e-10
 
-        # Calculate actual variance: N0 = Es / SNR_linear
         noise_variance_batch[valid_power_mask] = signal_power_batch[valid_power_mask] / snr_linear_batch[valid_power_mask]
             
         # 5. Generate and Scale Noise

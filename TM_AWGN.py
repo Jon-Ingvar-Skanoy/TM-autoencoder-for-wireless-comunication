@@ -14,12 +14,10 @@ logging.getLogger('PIL').setLevel(logging.WARNING)
 logging.getLogger('matplotlib').setLevel(logging.WARNING)
 
 import torch
-import torch.nn as nn
-import torch.optim as optim
+
 import numpy as np
 import matplotlib.pyplot as plt
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-import torch.nn.functional as F
+
 import time
  # Added for path handling
 import joblib
@@ -530,12 +528,39 @@ def generate_fading_coefficient(batch_size, channel_type, device):
 
     return torch.cat((h_real, h_imag), dim=1)
 
-def channel(x, snr_db, channel_type='AWGN', h=None):
+
+def channel(x, ebn0_db, k_bits = 4, channel_type='AWGN', h=None):
     """
-    Simulates a wireless channel with fading and AWGN.
-    x: (batch_size, 2*n) - transmitted signal
-    h: (batch_size, 2) - ONE complex fading coefficient per batch item (optional)
+    Applies channel effects using Eb/N0 as the noise parameter.
+    
+    Args:
+        x: Input tensor of shape (Batch_Size, 2*N_symbols)
+        ebn0_db: Energy per Bit to Noise Power Spectral Density ratio (in dB)
+        k_bits: Number of information bits per block (e.g., K_NORMAL)
+        channel_type: 'AWGN', 'Rayleigh', or 'Rician'
+        h: Fading coefficients (optional)
     """
+    
+    # --- 1. Calculate Rate (R) ---
+    # We assume x contains complex symbols split into 2 real dimensions.
+    # Shape of x is [Batch, 2*N], so number of complex symbols is x.shape[1] / 2
+    n_complex_symbols = x.shape[1] / 2.0
+    
+    # Rate = Bits / Complex Symbol
+    rate = k_bits / n_complex_symbols 
+
+    # --- 2. Convert Eb/N0 to SNR (Es/N0) ---
+    # Formula: SNR (linear) = (Eb/N0_linear) * Rate
+    # In dB:   SNR_dB = Eb/N0_dB + 10*log10(Rate)
+    
+    ebn0_linear = 10.0 ** (ebn0_db / 10.0)
+    snr_linear = ebn0_linear * rate
+
+    # Handle if ebn0_db was a tensor (per-sample noise)
+    if isinstance(snr_linear, torch.Tensor) and snr_linear.ndim == 1:
+        snr_linear = snr_linear.view(-1, 1)
+
+    # --- 3. Apply Fading (Same as before) ---
     if channel_type in ['Rayleigh', 'Rician']:
         if h is None:
             h = generate_fading_coefficient(x.shape[0], channel_type, x.device)
@@ -544,20 +569,21 @@ def channel(x, snr_db, channel_type='AWGN', h=None):
         signal_after_fading = x
         h = None
 
-    # Add noise
-    signal_power = torch.mean(signal_after_fading**2)
-    snr_linear = 10**(snr_db / 10.0)
+    # --- 4. Add Noise based on calculated SNR ---
+    signal_power = torch.mean(x**2, dim=1, keepdim=True)
+    noise_variance = torch.zeros_like(signal_power)
     
-    if signal_power.item() < 1e-10:
-        noise_variance = 1.0 / snr_linear
-    else:
-        noise_variance = signal_power / snr_linear
-        
-    noise = torch.randn_like(signal_after_fading) * torch.sqrt(noise_variance)
+    valid_mask = signal_power > 1e-10
+    
+    # Use the calculated snr_linear here
+    noise_variance[valid_mask] = signal_power[valid_mask] / snr_linear
+    
+    noise_std = torch.sqrt(noise_variance)
+    noise = torch.randn_like(signal_after_fading) * noise_std
+    
     y = signal_after_fading + noise
-
+    
     return y, h
-
 
 # --- Training Functions ---
 def train_autoencoder(tm_decoder, tm_encoders, epochs, snr_db, channel_type):
@@ -625,7 +651,9 @@ def train_autoencoder(tm_decoder, tm_encoders, epochs, snr_db, channel_type):
     
         x = x.cpu().numpy()
         signal_power = np.mean(x**2)
-        snr_linear = 10**(current_snr / 10.0)
+        rate = K_NORMAL / N_NORMAL
+
+        snr_linear = 10**(current_snr / 10.0) * rate
         
         if signal_power.item() < 1e-10:
             noise_variance = 1.0 / snr_linear
@@ -747,7 +775,7 @@ def evaluate_and_plot_bler(encoder, decoder_tm, channel_type, n, m,
 
             x_tensor, power = power_normalize(torch.tensor(x, dtype=torch.float32))
             
-            y_tensor, _ = channel(x_tensor, snr_db, channel_type)
+            y_tensor, _ = channel(x_tensor, snr_db, k_bits=K_NORMAL, channel_type=channel_type)
             y = y_tensor.cpu().numpy()
         
             y_tm_input = preprosses_TM_Decoder(y, N_NORMAL , num_bands=num_bands)
@@ -866,16 +894,17 @@ def evaluate_qpsk_repetition_bler(snr_min_db, snr_max_db, n_test_batches, batch_
     """
     Evaluates the BLER of a (16, 4) Repetition Code with QPSK modulation.
     
+    Configuration:
     - k = 4 info bits
-    - (16, 4) Repetition Code (Rate 1/4) -> 16 coded bits
-    - QPSK modulation (2 bits/symbol) -> 8 complex symbols (16 real values)
-    - Total Rate = k/n = 4/8 = 0.5 bits/symbol
+    - (16, 4) Repetition Code (Rate 1/4) -> 16 coded bits (Repetition Factor = 4)
+    - QPSK modulation (2 bits/symbol) -> 8 complex symbols (16 real dimensions)
+    - Total Rate = k/symbols = 4/8 = 0.5 bits/symbol
     """
     print(f"\n--- Phase 2b: Evaluating QPSK + (16,4) Repetition Code ({channel_type}) ---")
     
-    k = K_NORMAL # 4 info bits
-    n_coded_bits = 2 * N_NORMAL # 16 coded bits
-    n_symbols = N_NORMAL # 8 complex symbols
+    k = K_NORMAL        # 4 info bits
+    n_coded_bits = 16   # Fixed for (16,4) code
+    rep_factor = n_coded_bits // k # 4
 
     snr_db_values = np.arange(snr_min_db, snr_max_db + 1, 1)
     bler_qpsk_list = []
@@ -893,50 +922,58 @@ def evaluate_qpsk_repetition_bler(snr_min_db, snr_max_db, n_test_batches, batch_
             
             # 2. Encode: (16, 4) Repetition Code
             # [b1, b2, b3, b4] -> [b1,b1,b1,b1, b2,b2,b2,b2, ...]
-            x_coded_bits = np.repeat(s_info_bits, n_coded_bits // k, axis=1) # Shape: (batch_size, 16)
+            # We repeat each element 4 times
+            x_coded_bits = np.repeat(s_info_bits, rep_factor, axis=1) # Shape: (batch_size, 16)
             
             # 3. Modulate: QPSK
-            # Map 0 -> 1, 1 -> -1
-            # Bits [0, 2, 4, ...] map to I-channel
-            # Bits [1, 3, 5, ...] map to Q-channel
+            # Map 0 -> +1, 1 -> -1 (BPSK mapping applied to I and Q separately)
             x_mapped = 1 - 2 * x_coded_bits # Shape: (batch_size, 16)
             
-            # Create transmitted signal x with shape (batch_size, 2*n)
-            # [I1, Q1, I2, Q2, ...]
+            # Create transmitted signal x with shape (batch_size, 16)
+            # We treat the 16 items as 8 complex symbols (16 real values)
+            # Even indices -> I component, Odd indices -> Q component
             x_tx = np.empty((batch_size, n_coded_bits), dtype=np.float32)
             x_tx[:, 0::2] = x_mapped[:, 0::2] # I components
             x_tx[:, 1::2] = x_mapped[:, 1::2] # Q components
             
-            # Power check: E[x_tx^2] = E[I^2] or E[Q^2] = E[(+/-1)^2] = 1.0
-            # This matches the power normalization of the TM encoder output.
-            
+            # Convert to tensor
             x_tensor = torch.tensor(x_tx, dtype=torch.float32).to(DEVICE)
             
-            # 4. Channel: Use the *exact same* channel function
-            y_tensor, _ = channel(x_tensor, snr_db, channel_type)
+            # 4. Channel
+            # Note: k_bits is just for logging/normalization inside channel, passing K_NORMAL is fine
+            y_tensor, _ = channel(x_tensor, snr_db, k_bits=K_NORMAL, channel_type=channel_type)
             y_received = y_tensor.cpu().numpy() # Shape: (batch_size, 16)
             
             # 5. Demodulate: Hard-decision QPSK
-            y_I = y_received[:, 0::2] # (batch_size, 8)
-            y_Q = y_received[:, 1::2] # (batch_size, 8)
+            # Received > 0 -> mapped +1 -> original bit 0
+            # Received < 0 -> mapped -1 -> original bit 1
+            y_coded_bits = np.zeros((batch_size, n_coded_bits), dtype=int)
             
-            # Decision: y > 0 -> 0 (was 1), y < 0 -> 1 (was -1)
-            y_coded_bits = np.empty((batch_size, n_coded_bits), dtype=int)
-            y_coded_bits[:, 0::2] = (y_I < 0).astype(int)
-            y_coded_bits[:, 1::2] = (y_Q < 0).astype(int)
+            # Check I components (even indices) and Q components (odd indices)
+            y_coded_bits[:, 0::2] = (y_received[:, 0::2] < 0).astype(int)
+            y_coded_bits[:, 1::2] = (y_received[:, 1::2] < 0).astype(int)
             
             # 6. Decode: Majority vote for (16, 4) repetition code
             decoded_info_bits = np.empty((batch_size, k), dtype=int)
+            
             for i in range(k):
-                # Get the 4 repeated bits for this info bit
-                bit_block = y_coded_bits[:, i*4 : (i+1)*4]
-                # Sum the 1s (majority vote)
+                # Extract the block of 4 repeated bits corresponding to info bit i
+                # e.g., for i=0, we take indices 0,1,2,3
+                start_idx = i * rep_factor
+                end_idx = (i + 1) * rep_factor
+                bit_block = y_coded_bits[:, start_idx : end_idx]
+                
+                # Sum the 1s
                 vote_sum = np.sum(bit_block, axis=1) # Shape: (batch_size,)
-                # If sum > 2 (e.g., 3 or 4), decode as 1. Else 0.
+                
+                # Majority vote: If sum >= 2, we assume it was a 1. 
+                # (Note: Ties (2 vs 2) need a decision. Here we define >= 2 as 1, or > 2 as 1.
+                # Standard repetition code usually breaks ties randomly or consistently.
+                # Here: > 2 means strictly 3 or 4 votes.
                 decoded_info_bits[:, i] = (vote_sum > 2).astype(int)
             
             # 7. Calculate BLER
-            # A block error occurs if *any* info bit is wrong
+            # A block error occurs if *any* of the k info bits are wrong
             errors = np.any(decoded_info_bits != s_info_bits, axis=1)
             total_errors += np.sum(errors)
 
@@ -947,22 +984,23 @@ def evaluate_qpsk_repetition_bler(snr_min_db, snr_max_db, n_test_batches, batch_
     end_time = time.time()
     print(f"QPSK Rep. evaluation finished in {end_time - start_time:.2f} seconds.")
     
-    return snr_db_values, bler_qpsk_list
+    return snr_db_values, np.array(bler_qpsk_list)
+
+
+
+
 
 def evaluate_hamming_bler(snr_min_db, snr_max_db, n_test_batches, batch_size, channel_type):
     """
     Evaluates the BLER of an (8, 4) Extended Hamming Code with BPSK modulation.
-    
-    - k = 4 info bits
-    - (8, 4) Extended Hamming Code (Rate 1/2) -> 8 coded bits
-    - BPSK modulation (1 bit/symbol) -> 8 complex symbols (using only I-channel)
-    - Total Rate = k/n = 4/8 = 0.5 bits/symbol
     """
     print(f"\n--- Phase 2c: Evaluating BPSK + (8,4) Ext. Hamming Code ({channel_type}) ---")
     
-    k = K_NORMAL # 4 info bits
-    n_coded_bits = 2 * N_NORMAL # 8 coded bits
-    n_symbols = N_NORMAL # 8 complex symbols
+    k = 4 # Fixed for (8,4) Hamming
+    n_coded_bits = 8 # Fixed for (8,4) Hamming
+    
+    # BPSK means 1 bit per symbol, so we need 8 symbols for 8 bits
+    n_symbols = n_coded_bits 
 
     snr_db_values = np.arange(snr_min_db, snr_max_db + 1, 1)
     bler_hamming_list = []
@@ -985,28 +1023,30 @@ def evaluate_hamming_bler(snr_min_db, snr_max_db, n_test_batches, batch_size, ch
             p2 = (d1 + d3 + d4) % 2
             p3 = (d2 + d3 + d4) % 2
             
-            # (7,4) codeword
+            # (7,4) codeword structure: [p1, p2, d1, p3, d2, d3, d4]
             c7 = np.stack([p1, p2, d1, p3, d2, d3, d4], axis=1)
             
-            # (8,4) Overall parity bit
+            # (8,4) Overall parity bit (for the extended code)
             p4 = np.sum(c7, axis=1) % 2
             
-            # Final 8-bit codeword
-            x_coded_bits = np.hstack([c7, p4[:, np.newaxis]])
+            # Final 8-bit codeword: [p1, p2, d1, p3, d2, d3, d4, p4]
+            x_coded_bits = np.hstack([c7, p4[:, np.newaxis]]) # Shape: (batch_size, 8)
             
             # 3. Modulate: BPSK
             # Map 0 -> +1, 1 -> -1
             x_mapped = 1 - 2 * x_coded_bits # Shape: (batch_size, 8)
             
-            # Create (batch_size, 16) signal for the channel function
-            # Place BPSK signal on the I-channel (indices 0, 2, 4, ...)
+            # Create transmitted signal x.
+            # We need 2 real values per symbol (I and Q).
+            # Total real dimensions = 2 * n_symbols = 16
             x_tx_complex = np.zeros((batch_size, 2 * n_symbols), dtype=np.float32)
+    
             x_tx_complex[:, 0::2] = x_mapped
             
             x_tensor = torch.tensor(x_tx_complex, dtype=torch.float32).to(DEVICE)
             
-            # 4. Channel: Use the exact same channel function
-            y_tensor, _ = channel(x_tensor, snr_db, channel_type)
+            # 4. Channel
+            y_tensor, _ = channel(x_tensor, snr_db, k_bits=K_NORMAL, channel_type=channel_type)
             y_received = y_tensor.cpu().numpy() # Shape: (batch_size, 16)
             
             # 5. Demodulate: Hard-decision BPSK from I-channel
@@ -1014,7 +1054,6 @@ def evaluate_hamming_bler(snr_min_db, snr_max_db, n_test_batches, batch_size, ch
             y_coded_bits = (y_I < 0).astype(int)
             
             # 6. Decode: Hard-decision (8,4) Hamming Decoder
-            # This decoder can correct any single-bit error.
             r = y_coded_bits
             p1,p2,d1,p3,d2,d3,d4,p4 = r[:,0],r[:,1],r[:,2],r[:,3],r[:,4],r[:,5],r[:,6],r[:,7]
             
@@ -1029,23 +1068,14 @@ def evaluate_hamming_bler(snr_min_db, snr_max_db, n_test_batches, batch_size, ch
             # Overall parity check
             sP = np.sum(r, axis=1) % 2
             
-            # Create mask for all blocks
             corrected_bits = r.copy()
             
-            # Find single errors (s != 0 and sP == 1)
-            # Find error in p4 (s == 0 and sP == 1)
-            # No error (s == 0 and sP == 0)
-            # Uncorrectable error (s != 0 and sP == 0)
-            
-            # We only need to correct the errors we can
-            # Create a mask of blocks with correctable single errors
+            # Create masks for correction logic
             correctable_mask = (syndrome_int != 0) & (sP == 1)
-            
-            # Create a mask for p4 error
             p4_error_mask = (syndrome_int == 0) & (sP == 1)
 
-            # Vectorized correction
-            # This is tricky. A loop is clearer and fine for numpy.
+            # Apply corrections
+            # Using a loop for clarity on specific bit flipping
             for i in range(batch_size):
                 s = syndrome_int[i]
                 if correctable_mask[i]:
@@ -1054,10 +1084,9 @@ def evaluate_hamming_bler(snr_min_db, snr_max_db, n_test_batches, batch_size, ch
                 elif p4_error_mask[i]:
                     # Correct error in p4 (bit 7)
                     corrected_bits[i, 7] = 1 - corrected_bits[i, 7]
-                # If s != 0 and sP == 0, it's an uncorrectable error, so we do nothing.
                 
-            # 7. Extract info bits
-            decoded_info_bits = corrected_bits[:, [2, 4, 5, 6]] # d1, d2, d3, d4
+            # 7. Extract info bits: positions [2, 4, 5, 6] correspond to d1, d2, d3, d4
+            decoded_info_bits = corrected_bits[:, [2, 4, 5, 6]] 
             
             # 8. Calculate BLER
             errors = np.any(decoded_info_bits != s_info_bits, axis=1)
@@ -1070,60 +1099,9 @@ def evaluate_hamming_bler(snr_min_db, snr_max_db, n_test_batches, batch_size, ch
     end_time = time.time()
     print(f"BPSK Hamming evaluation finished in {end_time - start_time:.2f} seconds.")
     
-    return snr_db_values, bler_hamming_list
+    return snr_db_values, np.array(bler_hamming_list)
 
 
-def get_finite_blocklength_bound(snr_db_array, n_complex_symbols, k_bits):
-    """
-    Calculates the Polyanskiy-Poor-Verdu bound with the O(log n) correction
-    term, which is critical for very short blocks (N=8).
-    """
-    # 1. Convert SNR to Linear
-    snr_linear = 10.0**(snr_db_array / 10.0)
-    
-    # 2. Calculate Rate R (bits per channel use)
-    R = k_bits / n_complex_symbols
-    
-    # 3. Calculate Capacity C (bits per channel use)
-    C = np.log2(1 + snr_linear)
-    
-    # 4. Calculate Dispersion V
-    log2_e = 1.442695
-    V = (log2_e**2) * (1 - (1 / (1 + snr_linear)**2))
-    
-    # 5. The "Normal Approximation" with the log(n) correction term
-    # Formula: log M approx nC - sqrt(nV)*Z + 0.5*log(n)
-    # Rearranging for Z (which is Q_inv(epsilon)):
-    # sqrt(nV)*Z approx nC - nR + 0.5*log(n)
-    # Z approx (n(C - R) + 0.5*log2(n)) / sqrt(nV)
-    
-    # Handle V=0 (at SNR=0)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        # We calculate the argument for the Q-function
-        # Note the addition of the third term: 0.5 * np.log2(n_complex_symbols)
-        numerator = n_complex_symbols * (C - R) + 0.5 * np.log2(n_complex_symbols)
-        denominator = np.sqrt(n_complex_symbols * V)
-        
-        argument = numerator / denominator
-
-    # 6. Calculate BLER = Q(argument)
-    bler_bound = norm.sf(argument)
-    
-    # Clean up NaNs
-    bler_bound = np.nan_to_num(bler_bound, nan=1.0)
-    
-    return bler_bound
-
-def calculate_asymptotic_shannon_limit(k_bits, n_complex_symbols):
-    """
-    Calculates the strict vertical limit (N -> Infinity).
-    R = log2(1 + SNR)
-    """
-    R = k_bits / n_complex_symbols
-    # R = log2(1 + SNR)  ->  2^R = 1 + SNR  ->  SNR = 2^R - 1
-    snr_linear_limit = 2**(R) - 1
-    snr_db_limit = 10 * np.log10(snr_linear_limit)
-    return snr_db_limit
 
 
 # ==============================================================================
@@ -1163,21 +1141,11 @@ if __name__ == '__main__':
 
 
 
-    # --- 3. Run Benchmarks ---
-    
-  
-    ae_snr = np.arange(SNR_MIN, SNR_MAX + 1, 1) # Matches -4 to 8
-    ae_bler = np.array([
-        0.281753, 0.205342, 0.135093, 0.080239, 0.041270, 0.017329,
-        0.006187, 0.001724, 0.000303, 0.000068, 0.000010, 0.000002,
-        0.000002
-    ])
 
     # 2. Generate SNR range
     snr_range = np.linspace(-4, 10, 200)
 
-    # 3. Calculate the Finite Blocklength Curve (The "Real" Limit)
-    bler_finite = get_finite_blocklength_bound(snr_range, 8, 4)
+ 
 
 
 
