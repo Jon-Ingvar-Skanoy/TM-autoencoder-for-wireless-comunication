@@ -1168,22 +1168,21 @@ if __name__ == '__main__':
         snr_max_db=SNR_MAX,
         n_test_batches=N_BATCHES,
         batch_size=B_SIZE,
-        benchmark_data_list=benchmarks_list, # <-- Pass list here
-        save_path="bler_TM_vs_Benchmarks.png" # New save path
+        benchmark_data_list=benchmarks_list, 
+        save_path="bler_TM_vs_Benchmarks.png"
     )
 
     plot_throughput_kbps(
-    snr_db=np.arange(SNR_MIN, SNR_MAX + 1, 1), # Your SNR axis
-    bler_tm=evaluate_and_plot_bler_output[2],  # You need to capture the return value from your evaluation function
+    snr_db=np.arange(SNR_MIN, SNR_MAX + 1, 1),
+    bler_tm=evaluate_and_plot_bler_output[2],  
     benchmarks_list=benchmarks_list,
-    k_bits=K_NORMAL,       # 4
-    n_symbols=N_NORMAL,    # 8
-    symbol_rate_hz=2_000_000, # Example: 2 MHz bandwidth
-    save_path="throughput_kbps_comparison_AWGN.png" # New save path
+    k_bits=K_NORMAL,       
+    n_symbols=N_NORMAL,   
+    symbol_rate_hz=2_000_000,
+    save_path="throughput_kbps_comparison_AWGN.png"
 )
 
-    # save the trained TM models
-    # Create models directory if it doesn't exist
+ 
     os.makedirs('models', exist_ok=True)
 
   
