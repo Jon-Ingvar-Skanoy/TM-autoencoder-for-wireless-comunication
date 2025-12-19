@@ -443,11 +443,7 @@ N_NORMAL = 2
 K_NORMAL = 4
 M_NORMAL = 2**K_NORMAL
 
-# Covert Communication Parameters (Not used in this specific task but part of the context)
-N_COVERT = 8
-K_COVERT = 1
-M_COVERT = 2**K_COVERT
-Z_DIM = 16
+
 
 # Training Parameters
 BATCH_SIZE = 5000
